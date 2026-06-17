@@ -1,0 +1,12 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "snowflake/id_test.go",
+    "rand/id_test.go",
+    "toml/toml_test.go",
+    "jsonweb/token_test.go",
+    "kit/check/check_test.go"
+  ],
+  "validation_test_file_count": 5,
+  "validation_tests_executed": null
+}

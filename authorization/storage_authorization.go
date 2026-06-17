@@ -1,0 +1,743 @@
+package authorization
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	goerrors "errors"
+	"fmt"
+	"slices"
+
+	"github.com/buger/jsonparser"
+	"github.com/influxdata/influxdb/v2"
+	"github.com/influxdata/influxdb/v2/kit/platform"
+	"github.com/influxdata/influxdb/v2/kit/platform/errors"
+	"github.com/influxdata/influxdb/v2/kv"
+	jsonp "github.com/influxdata/influxdb/v2/pkg/jsonparser"
+	"go.uber.org/zap"
+)
+
+var (
+	ErrNilAuthorization    = goerrors.New("authorization cannot be nil")
+	ErrHashedTokenMismatch = goerrors.New("HashedToken does not match Token")
+	ErrNoTokenAvailable    = goerrors.New("no token available for authorization")
+)
+
+func getNamedAuthBucket(tx kv.Tx, bucketName []byte) (kv.Bucket, error) {
+	b, err := tx.Bucket(bucketName)
+	if err != nil {
+		return nil, UnexpectedAuthBucketError(bucketName, err)
+	}
+
+	return b, nil
+}
+
+func authBucket(tx kv.Tx) (kv.Bucket, error) {
+	return getNamedAuthBucket(tx, authBucketName)
+}
+
+func authIndexKey(n string) []byte {
+	return []byte(n)
+}
+
+func authIndexBucket(tx kv.Tx) (kv.Bucket, error) {
+	return getNamedAuthBucket(tx, authIndexName)
+}
+
+func hashedAuthIndexKey(n string) []byte {
+	return []byte(n)
+}
+
+func hashedAuthIndexBucket(tx kv.Tx) (kv.Bucket, error) {
+	return getNamedAuthBucket(tx, hashedAuthIndexName)
+}
+
+func (s *Store) encodeAuthorization(a *influxdb.Authorization) ([]byte, error) {
+	switch a.Status {
+	case influxdb.Active, influxdb.Inactive:
+	case "":
+		a.Status = influxdb.Active
+	default:
+		return nil, &errors.Error{
+			Code: errors.EInvalid,
+			Msg:  "encodeAuthorization: unknown authorization status",
+		}
+	}
+
+	// Redact Token, if needed. This is done at the lowest level so it is impossible to serialize
+	// raw tokens if hashing is enabled.
+	if s.useHashedTokens {
+		// Redact a copy, not the original. The raw Token value is still needed by the caller in some cases.
+		// Note that this is an empty string, not TokenRedactedMessage. TokenRedactedMessage is only used for
+		// user-facing output. The empty string signals that the plaintext token is not available and that
+		// the hashed token should be used instead.
+		redactedAuth := *a
+		redactedAuth.ClearToken()
+		a = &redactedAuth
+	}
+	if d, err := json.Marshal(a); err == nil {
+		return d, nil
+	} else {
+		return nil, &errors.Error{
+			Code: errors.EInvalid,
+			Msg:  "encodeAuthorization: marshalling error",
+			Err:  err,
+		}
+	}
+}
+
+func decodeAuthorization(b []byte, a *influxdb.Authorization) error {
+	if err := json.Unmarshal(b, a); err != nil {
+		return fmt.Errorf("decodeAuthorization: %w", err)
+	}
+	if a.Status == "" {
+		a.Status = influxdb.Active
+	}
+	return nil
+}
+
+// transformToken updates a.Token and a.HashedToken to match configuration state,
+// if needed. If needed, transformToken generates the a.HashedToken from a.Token when
+// token hashing is enabled. transformToken will also clear a.HashedToken if token
+// hashing is turned off and a.Token is set to the matching token. If a.HashedToken and
+// a.Token are both set but do not match (a.HashedToken is a hash of a.Token), then an
+// error is returned.
+func (s *Store) transformToken(a *influxdb.Authorization) error {
+	// Verify Token and HashedToken match if both are set.
+	if a.BothTokensSet() {
+		match, err := s.hasher.Match(a.HashedToken, a.Token)
+		if err != nil {
+			return fmt.Errorf("transformToken: error matching tokens: %w", err)
+		}
+		if !match {
+			return fmt.Errorf("transformToken: %w", ErrHashedTokenMismatch)
+		}
+	}
+
+	if a.IsTokenSet() {
+		if s.useHashedTokens {
+			// Need to generate HashedToken from Token. Redaction of the hashed token takes
+			// place when the record is written to the KV store. In some cases the client
+			// code that triggered commit needs access to the raw Token, such as when a
+			// token is initially created so it can be shown to the user.
+			// Note that even if a.HashedToken is set, we will regenerate it here. This ensures
+			// that a.HashedToken will be stored using the currently configured hashing algorithm.
+			if hashedToken, err := s.hasher.Hash(a.Token); err != nil {
+				return fmt.Errorf("transformToken: error hashing token for token %d (%s): %w", a.ID, a.Description, err)
+			} else {
+				a.HashedToken = hashedToken
+			}
+		} else {
+			// Token hashing disabled, a.Token is available, clear a.HashedToken if set.
+			a.ClearHashedToken()
+		}
+	}
+
+	return nil
+}
+
+// CreateAuthorization takes an Authorization object and saves it in storage using its token
+// using its token property as an index. The contents of a should be considered invalid if an
+// error occurs.
+func (s *Store) CreateAuthorization(ctx context.Context, tx kv.Tx, a *influxdb.Authorization) (retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpCreateAuthorization))
+	}()
+
+	if a == nil {
+		return ErrNilAuthorization
+	}
+
+	// if the provided ID is invalid, or already maps to an existing Auth, then generate a new one
+	if !a.ID.Valid() {
+		id, err := s.generateSafeID(ctx, tx, authBucketName)
+		if err != nil {
+			return nil
+		}
+		a.ID = id
+	} else if err := uniqueID(ctx, tx, a.ID); err != nil {
+		id, err := s.generateSafeID(ctx, tx, authBucketName)
+		if err != nil {
+			return nil
+		}
+		a.ID = id
+	}
+
+	// Token must be unique to create authorization.
+	if err := s.uniqueAuthToken(ctx, tx, a); err != nil {
+		return err
+	}
+
+	return s.commitAuthorization(ctx, tx, a)
+}
+
+// GetAuthorization gets an authorization by its ID from the auth bucket in kv
+func (s *Store) GetAuthorizationByID(ctx context.Context, tx kv.Tx, id platform.ID) (auth *influxdb.Authorization, retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpFindAuthorizationByID))
+	}()
+	encodedID, err := id.Encode()
+	if err != nil {
+		return nil, ErrInvalidAuthID
+	}
+
+	b, err := authBucket(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	v, err := b.Get(encodedID)
+	if kv.IsNotFound(err) {
+		return nil, ErrAuthNotFound
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	a := &influxdb.Authorization{}
+	if err := decodeAuthorization(v, a); err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+// validateToken checks if token matches that token stored in auth. If auth.Token is set, that is
+// compared first. Otherwise, auth.HashedToken is used to verify token. If neither field in auth is set, then
+// the comparison fails.
+func (s *Store) validateToken(auth *influxdb.Authorization, token string) (bool, error) {
+	if auth.IsTokenSet() {
+		return subtle.ConstantTimeCompare([]byte(auth.Token), []byte(token)) == 1, nil
+	}
+
+	if auth.IsHashedTokenSet() {
+		match, err := s.hasher.Match(auth.HashedToken, token)
+		if err != nil {
+			return false, fmt.Errorf("error matching hashed token %d (%s) for validation: %w", auth.ID, auth.Description, err)
+		}
+		return match, nil
+	}
+
+	return false, ErrNoTokenAvailable
+}
+
+// GetAuthorizationsByToken searches for an authorization by its raw (unhashed) token value. It will also search
+// for entires with equivalent hashed tokens if the raw token is not directly found.
+func (s *Store) GetAuthorizationByToken(ctx context.Context, tx kv.Tx, token string) (auth *influxdb.Authorization, retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpFindAuthorizationByToken))
+	}()
+	idx, err := authIndexBucket(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	// use the token to look up the authorization's ID
+	idKey, err := idx.Get(authIndexKey(token))
+	if kv.IsNotFound(err) {
+		authNotFoundErr := &errors.Error{
+			Code: errors.ENotFound,
+			Msg:  "authorization not found",
+		}
+
+		// Look for hashed token in hashed index. We have to do this even if hashed token storage is
+		// currently turned off, because it may have been enabled previously, which means the token
+		// could still be indexed by the hash.
+		hashIdx, err := hashedAuthIndexBucket(tx)
+		if err != nil {
+			if s.ignoreMissingHashIndex && goerrors.Is(err, kv.ErrBucketNotFound) {
+				return nil, authNotFoundErr
+			} else {
+				return nil, err
+			}
+		}
+
+		// Try to look up token in hashed index. We have to do the lookup for all potential hash variants.
+		// We also have to do this even if hashed token storage is off, because we might have indexed by
+		// the hash when it previously enabled.
+		allHashes, err := s.hasher.AllHashes(token)
+		if err != nil {
+			return nil, err
+		} else if len(allHashes) == 0 {
+			// No hashed tokens to lookup (shouldn't happen, but just in case it does).
+			return nil, authNotFoundErr
+		}
+		found := false // found shouldn't really be needed since we know allHashes is not empty, but it's nice for extra safety.
+		for _, hashedToken := range allHashes {
+			// Very important we update the existing idKey and err variables and don't create new ones here.
+			idKey, err = hashIdx.Get(hashedAuthIndexKey(hashedToken))
+			if err == nil {
+				// We found it! Stop looking. err will be nil after loop.
+				found = true
+				break
+			} else {
+				// Keep looking if we got a not found error.
+				if !kv.IsNotFound(err) {
+					return nil, err
+				}
+			}
+		}
+		if !found || kv.IsNotFound(err) {
+			return nil, authNotFoundErr
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	var id platform.ID
+	if err := id.Decode(idKey); err != nil {
+		return nil, &errors.Error{
+			Code: errors.EInvalid,
+			Err:  err,
+		}
+	}
+
+	// Verify that the token stored in auth matches the requested token. This should be superfluous check, but
+	// we will just in case somehow the authorization record got out of sync with the index.
+	auth, err = s.GetAuthorizationByID(ctx, tx, id)
+	if err != nil {
+		return nil, &errors.Error{
+			Code: errors.EInternal,
+			Err:  err,
+		}
+	}
+	match, err := s.validateToken(auth, token)
+	if err != nil {
+		return nil, &errors.Error{
+			Code: errors.EInternal,
+			Err:  err,
+		}
+	}
+	if !match {
+		return nil, errors.EIncorrectPassword
+	}
+	return auth, nil
+}
+
+// ListAuthorizations returns all the authorizations matching a set of FindOptions. This function is used for
+// FindAuthorizationByID, FindAuthorizationByToken, and FindAuthorizations in the AuthorizationService implementation
+func (s *Store) ListAuthorizations(ctx context.Context, tx kv.Tx, f influxdb.AuthorizationFilter) (auths []*influxdb.Authorization, retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpFindAuthorizations))
+	}()
+	var as []*influxdb.Authorization
+	pred := s.authorizationsPredicateFn(f)
+	filterFn := s.filterAuthorizationsFn(f)
+	err := s.forEachAuthorization(ctx, tx, pred, func(a *influxdb.Authorization) bool {
+		if filterFn(a) {
+			as = append(as, a)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return as, nil
+}
+
+// forEachAuthorization will iterate through all authorizations while fn returns true.
+func (s *Store) forEachAuthorization(ctx context.Context, tx kv.Tx, pred kv.CursorPredicateFunc, fn func(*influxdb.Authorization) bool) error {
+	b, err := authBucket(tx)
+	if err != nil {
+		return err
+	}
+
+	var cur kv.Cursor
+	if pred != nil {
+		cur, err = b.Cursor(kv.WithCursorHintPredicate(pred))
+	} else {
+		cur, err = b.Cursor()
+	}
+	if err != nil {
+		return err
+	}
+
+	for k, v := cur.First(); k != nil; k, v = cur.Next() {
+		// preallocate Permissions to reduce multiple slice re-allocations
+		a := &influxdb.Authorization{
+			Permissions: make([]influxdb.Permission, 64),
+		}
+
+		if err := decodeAuthorization(v, a); err != nil {
+			return err
+		}
+		if !fn(a) {
+			break
+		}
+	}
+
+	return nil
+}
+
+// commitAuthorization performs pre-commit checks and updates to an authorization record, commits it,
+// and makes sure indices point to it. It does not delete any indices. The updated authorization is
+// returned on success.
+func (s *Store) commitAuthorization(ctx context.Context, tx kv.Tx, a *influxdb.Authorization) error {
+	if err := s.transformToken(a); err != nil {
+		return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+	}
+
+	// Sanity check that a is actually set. Shouldn't be possible during normal operation.
+	if a.NoTokensSet() {
+		return fmt.Errorf("commitAuthorization: %w", ErrNoTokenAvailable)
+	}
+
+	v, err := s.encodeAuthorization(a)
+	if err != nil {
+		return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInvalid))
+	}
+
+	encodedID, err := a.ID.Encode()
+	if err != nil {
+		return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.ENotFound))
+	}
+
+	if !s.useHashedTokens && a.IsTokenSet() {
+		idx, err := authIndexBucket(tx)
+		if err != nil {
+			return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+		}
+
+		if err := idx.Put(authIndexKey(a.Token), encodedID); err != nil {
+			return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+		}
+	}
+
+	// If we have a hashed token, we need to add it to the index even if hashed tokens are not
+	// available. This is because if hashed tokens are enabled and then disabled, we will
+	// only have hashed tokens available for some authorization records. They would be unusable
+	// if we did not maintain their hashed indices.
+	if a.IsHashedTokenSet() {
+		idx, err := hashedAuthIndexBucket(tx)
+		// Don't ignore a missing index here, we want an error.
+		if err != nil {
+			return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+		}
+
+		if err := idx.Put(hashedAuthIndexKey(a.HashedToken), encodedID); err != nil {
+			return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+		}
+	}
+
+	b, err := authBucket(tx)
+	if err != nil {
+		return err // authBucket already wraps the error
+	}
+
+	if err := b.Put(encodedID, v); err != nil {
+		return errors.ErrInternalServiceError(err, errors.WithErrorCode(errors.EInternal))
+	}
+
+	return nil
+}
+
+// deleteIndices removes indices for the given token and hashedToken.
+func (s *Store) deleteIndices(ctx context.Context, tx kv.Tx, token, hashedToken string) error {
+	authIdx, err := authIndexBucket(tx)
+	if err != nil {
+		return err
+	}
+
+	hashedAuthIdx, err := hashedAuthIndexBucket(tx)
+	// Don't ignore missing index during an update.
+	if err != nil {
+		return err
+	}
+
+	if influxdb.IsAuthTokenSet(token) {
+		if err := authIdx.Delete([]byte(token)); err != nil {
+			return fmt.Errorf("deleteIndices: error deleting from authIndex: %w", err)
+		}
+	}
+
+	if influxdb.IsAuthTokenSet(hashedToken) {
+		if err := hashedAuthIdx.Delete([]byte(hashedToken)); err != nil {
+			return fmt.Errorf("deleteIndices: error deleting from hashedAuthIndex: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// UpdateAuthorization updates the status and description only of an authorization
+func (s *Store) UpdateAuthorization(ctx context.Context, tx kv.Tx, id platform.ID, a *influxdb.Authorization) (auth *influxdb.Authorization, retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpUpdateAuthorization))
+	}()
+
+	if a == nil {
+		return nil, ErrNilAuthorization
+	}
+
+	initialToken := a.Token
+	initialHashedToken := a.HashedToken
+
+	if err := s.commitAuthorization(ctx, tx, a); err != nil {
+		return nil, err
+	}
+
+	// Delete dangling indices from old raw tokens or hashed tokens.
+	var removedToken string
+	if influxdb.IsAuthTokenSet(initialToken) && (a.Token != initialToken || s.useHashedTokens) {
+		removedToken = initialToken
+	}
+
+	var removedHashedToken string
+	if influxdb.IsAuthTokenSet(initialHashedToken) && a.HashedToken != initialHashedToken {
+		removedHashedToken = initialHashedToken
+	}
+
+	if err := s.deleteIndices(ctx, tx, removedToken, removedHashedToken); err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+// DeleteAuthorization removes an authorization from storage
+func (s *Store) DeleteAuthorization(ctx context.Context, tx kv.Tx, id platform.ID) (retErr error) {
+	defer func() {
+		retErr = errors.ErrInternalServiceError(retErr, errors.WithErrorOp(influxdb.OpDeleteAuthorization))
+	}()
+	a, err := s.GetAuthorizationByID(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+
+	encodedID, err := id.Encode()
+	if err != nil {
+		return ErrInvalidAuthID
+	}
+
+	b, err := authBucket(tx)
+	if err != nil {
+		return err
+	}
+
+	if err := s.deleteIndices(ctx, tx, a.Token, a.HashedToken); err != nil {
+		return err
+	}
+
+	if err := b.Delete(encodedID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Store) uniqueAuthTokenByIndex(ctx context.Context, tx kv.Tx, index, key []byte) error {
+	if err := unique(ctx, tx, index, key); err == nil {
+		return nil
+	} else if err == kv.NotUniqueError {
+		// by returning a generic error we are trying to hide when
+		// a token is non-unique.
+		return influxdb.ErrUnableToCreateToken
+	} else {
+		// otherwise, this is some sort of internal server error and we
+		// should provide some debugging information.
+		return fmt.Errorf("error in uniqueAuthTokenByIndex for index %q: %w", index, err)
+	}
+}
+
+func (s *Store) uniqueAuthToken(ctx context.Context, tx kv.Tx, a *influxdb.Authorization) error {
+	// Check if the raw token is unique.
+	if a.IsTokenSet() {
+		if err := s.uniqueAuthTokenByIndex(ctx, tx, authIndexName, authIndexKey(a.Token)); err != nil {
+			return err
+		}
+	}
+
+	// If Token is available, check for the uniqueness of the hashed version of Token using all
+	// potential hashing schemes. If HashedToken was directly given, we must also check for it.
+	allHashedTokens := make([]string, 0, s.hasher.AllHashesCount()+1)
+	if a.IsHashedTokenSet() {
+		allHashedTokens = append(allHashedTokens, a.HashedToken)
+	}
+	if a.IsTokenSet() {
+		allRawHashes, err := s.hasher.AllHashes(a.Token)
+		if err != nil {
+			return err
+		}
+		allHashedTokens = append(allHashedTokens, allRawHashes...)
+	}
+
+	for _, hashedToken := range allHashedTokens {
+		if err := s.uniqueAuthTokenByIndex(ctx, tx, hashedAuthIndexName, hashedAuthIndexKey(hashedToken)); err != nil {
+			if !s.ignoreMissingHashIndex || !goerrors.Is(err, kv.ErrBucketNotFound) {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func unique(ctx context.Context, tx kv.Tx, indexBucket, indexKey []byte) error {
+	bucket, err := getNamedAuthBucket(tx, indexBucket)
+	if err != nil {
+		return err
+	}
+
+	_, err = bucket.Get(indexKey)
+	// if not found then this token is unique.
+	if kv.IsNotFound(err) {
+		return nil
+	}
+
+	// no error means this is not unique
+	if err == nil {
+		return kv.NotUniqueError
+	}
+
+	// any other error is some sort of internal server error
+	return kv.UnexpectedIndexError(err)
+}
+
+// uniqueID returns nil if the ID provided is unique, returns an error otherwise
+func uniqueID(ctx context.Context, tx kv.Tx, id platform.ID) error {
+	encodedID, err := id.Encode()
+	if err != nil {
+		return ErrInvalidAuthID
+	}
+
+	b, err := authBucket(tx)
+	if err != nil {
+		return err // authBucket already wraps the error
+	}
+
+	_, err = b.Get(encodedID)
+	// if not found then the ID is unique
+	if kv.IsNotFound(err) {
+		return nil
+	}
+	// no error means this is not unique
+	if err == nil {
+		return kv.NotUniqueError
+	}
+
+	// any other error is some sort of internal server error
+	return kv.UnexpectedIndexError(err)
+}
+
+func (s *Store) authorizationsPredicateFn(f influxdb.AuthorizationFilter) kv.CursorPredicateFunc {
+	// if any errors occur reading the JSON data, the predicate will always return true
+	// to ensure the value is included and handled higher up.
+
+	if f.ID != nil {
+		exp := *f.ID
+		return func(_, value []byte) bool {
+			got, err := jsonp.GetID(value, "id")
+			if err != nil {
+				return true
+			}
+			return got == exp
+		}
+	}
+
+	if f.Token != nil {
+		token := *f.Token
+		allHashes, err := s.hasher.AllHashes(token)
+		if err != nil {
+			s.log.Error("error generating hashes in authorizationsPredicateFn", zap.Error(err))
+			// On error, continue onward. allHashes is empty and we'll effectively ignore hashedToken,
+			// but we'll still look at the unhashed Token if it is available.
+		}
+		return func(_, value []byte) bool {
+			// Check if "token" matches. It is assumed that token never has escaped string data.
+			if got, _, _, err := jsonparser.Get(value, "token"); err == nil {
+				if len(got) > 0 {
+					return string(got) == token
+				}
+			} else {
+				return true // predicate must return true on errors
+			}
+
+			// Check if "hashedToken" matches, if applicable.
+			if len(allHashes) > 0 {
+				if got, _, _, err := jsonparser.Get(value, "hashedToken"); err == nil {
+					if len(got) > 0 {
+						return slices.Contains(allHashes, string(got))
+					}
+				} else {
+					return true // predicate must return true on errors
+				}
+			}
+
+			// No match on "token" or "hashedToken", do not include this record.
+			return false
+		}
+	}
+
+	var pred kv.CursorPredicateFunc
+	if f.OrgID != nil {
+		exp := *f.OrgID
+		pred = func(_, value []byte) bool {
+			got, err := jsonp.GetID(value, "orgID")
+			if err != nil {
+				return true
+			}
+
+			return got == exp
+		}
+	}
+
+	if f.UserID != nil {
+		exp := *f.UserID
+		prevFn := pred
+		pred = func(key, value []byte) bool {
+			prev := prevFn == nil || prevFn(key, value)
+			got, exists, err := jsonp.GetOptionalID(value, "userID")
+			return prev && ((exp == got && exists) || err != nil)
+		}
+	}
+
+	return pred
+}
+
+func (s *Store) filterAuthorizationsFn(filter influxdb.AuthorizationFilter) func(a *influxdb.Authorization) bool {
+	if filter.ID != nil {
+		return func(a *influxdb.Authorization) bool {
+			return a.ID == *filter.ID
+		}
+	}
+
+	if filter.Token != nil {
+		token := *filter.Token
+		allHashes, err := s.hasher.AllHashes(token)
+		if err != nil {
+			s.log.Error("error generating hashes in filterPredicateFn", zap.Error(err))
+			// On error, continue onward. allHashes is empty and we'll effectively ignore hashedToken,
+			// but we'll still look at the unhashed Token if it is available.
+		}
+
+		return func(a *influxdb.Authorization) bool {
+			if subtle.ConstantTimeCompare([]byte(a.Token), []byte(token)) == 1 {
+				return true
+			}
+			return slices.Contains(allHashes, a.HashedToken)
+		}
+	}
+
+	// Filter by org and user
+	if filter.OrgID != nil && filter.UserID != nil {
+		return func(a *influxdb.Authorization) bool {
+			return a.OrgID == *filter.OrgID && a.UserID == *filter.UserID
+		}
+	}
+
+	if filter.OrgID != nil {
+		return func(a *influxdb.Authorization) bool {
+			return a.OrgID == *filter.OrgID
+		}
+	}
+
+	if filter.UserID != nil {
+		return func(a *influxdb.Authorization) bool {
+			return a.UserID == *filter.UserID
+		}
+	}
+
+	return func(a *influxdb.Authorization) bool { return true }
+}
