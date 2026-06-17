@@ -1,0 +1,10 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "tsdb/engine/tsm1/ext_file_stat_test.go",
+    "tsdb/engine/tsm1/compact_test.go",
+    "tsdb/engine/tsm1/file_store_test.go"
+  ],
+  "validation_test_file_count": 3,
+  "validation_tests_executed": null
+}
