@@ -176,6 +176,25 @@ type fileStore interface {
 	TSMReader(path string) (*TSMReader, error)
 }
 
+type fileStoreExtStatsProvider interface {
+	ExtStats() []ExtFileStat
+}
+
+func (c *DefaultPlanner) extStats() []ExtFileStat {
+	if provider, ok := c.FileStore.(fileStoreExtStatsProvider); ok {
+		return provider.ExtStats()
+	}
+
+	// Fallback for test mocks
+	stats := c.FileStore.Stats()
+	extStats := make([]ExtFileStat, len(stats))
+	for i, f := range stats {
+		extStats[i] = f.ToExtFileStat()
+		extStats[i].FirstBlockCount = c.FileStore.BlockCount(f.Path, 1)
+	}
+	return extStats
+}
+
 func NewDefaultPlanner(fs fileStore, writeColdDuration time.Duration) *DefaultPlanner {
 	return &DefaultPlanner{
 		FileStore:                          fs,
@@ -190,7 +209,7 @@ func NewDefaultPlanner(fs fileStore, writeColdDuration time.Duration) *DefaultPl
 // 000001 each with different sequence numbers.
 type tsmGeneration struct {
 	id            int
-	files         []FileStat
+	files         []ExtFileStat
 	parseFileName ParseFileNameFunc
 }
 
@@ -265,7 +284,7 @@ func (c *DefaultPlanner) generationsFullyCompacted(gens tsmGenerations) (bool, s
 			aggressivePointsPerBlockCount := 0
 			filesUnderMaxTsmSizeCount := 0
 			for _, tsmFile := range gens[0].files {
-				if c.FileStore.BlockCount(tsmFile.Path, 1) >= c.GetAggressiveCompactionPointsPerBlock() {
+				if tsmFile.FirstBlockCount >= c.GetAggressiveCompactionPointsPerBlock() {
 					aggressivePointsPerBlockCount++
 				}
 				if tsmFile.Size < tsdb.MaxTSMFileSize {
@@ -505,7 +524,7 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) ([]CompactionGroup, int64) {
 			var skip bool
 
 			// Skip the file if it's over the max size and contains a full block and it does not have any tombstones
-			if len(generations) > 2 && group.size() > uint64(tsdb.MaxTSMFileSize) && c.FileStore.BlockCount(group.files[0].Path, 1) >= tsdb.DefaultMaxPointsPerBlock && !group.hasTombstones() {
+			if len(generations) > 2 && group.size() > uint64(tsdb.MaxTSMFileSize) && group.files[0].FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock && !group.hasTombstones() {
 				skip = true
 			}
 
@@ -581,7 +600,7 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) ([]CompactionGroup, int64) {
 		// Skip the file if it's over the max size and contains a full block or the generation is split
 		// over multiple files.  In the latter case, that would mean the data in the file spilled over
 		// the 2GB limit.
-		if g.size() > uint64(tsdb.MaxTSMFileSize) && c.FileStore.BlockCount(g.files[0].Path, 1) >= tsdb.DefaultMaxPointsPerBlock {
+		if g.size() > uint64(tsdb.MaxTSMFileSize) && g.files[0].FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock {
 			start = i + 1
 		}
 
@@ -625,7 +644,7 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) ([]CompactionGroup, int64) {
 			}
 
 			// Skip the file if it's over the max size and it contains a full block
-			if gen.size() >= uint64(tsdb.MaxTSMFileSize) && c.FileStore.BlockCount(gen.files[0].Path, 1) >= tsdb.DefaultMaxPointsPerBlock && !gen.hasTombstones() {
+			if gen.size() >= uint64(tsdb.MaxTSMFileSize) && gen.files[0].FirstBlockCount >= tsdb.DefaultMaxPointsPerBlock && !gen.hasTombstones() {
 				startIndex++
 				continue
 			}
@@ -694,7 +713,7 @@ func (c *DefaultPlanner) findGenerations(skipInUse bool) tsmGenerations {
 	}
 
 	genTime := c.FileStore.LastModified()
-	tsmStats := c.FileStore.Stats()
+	tsmStats := c.extStats()
 	generations := make(map[int]*tsmGeneration, len(tsmStats))
 	for _, f := range tsmStats {
 		gen, _, _ := c.ParseFileName(f.Path)
