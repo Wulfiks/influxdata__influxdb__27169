@@ -172,7 +172,8 @@ type FileStore struct {
 	lastModified time.Time
 	// Most recently known file stats. If nil then stats will need to be
 	// recalculated
-	lastFileStats []FileStat
+	lastFileStats    []FileStat
+	lastExtFileStats []ExtFileStat
 
 	currentGeneration int
 	dir               string
@@ -210,6 +211,23 @@ type FileStat struct {
 	LastModified     int64
 	MinTime, MaxTime int64
 	MinKey, MaxKey   []byte
+}
+
+// ExtFileStat holds FileStat and the first block's point count.
+type ExtFileStat struct {
+	FileStat
+	FirstBlockCount int
+}
+
+// ToExtFileStat converts FileStat to ExtFileStat.
+func (f FileStat) ToExtFileStat() ExtFileStat {
+	return ExtFileStat{
+		FileStat: f,
+	}
+}
+
+type tsmFileExtStatsProvider interface {
+	ExtStats() (ExtFileStat, error)
 }
 
 // TombstoneStat holds information about a possible tombstone file on disk.
@@ -495,6 +513,7 @@ func (f *FileStore) Apply(ctx context.Context, fn func(r TSMFile) error) error {
 	f.mu.Lock()
 	f.lastModified = time.Now().UTC()
 	f.lastFileStats = nil
+	f.lastExtFileStats = nil
 	f.mu.Unlock()
 
 	return applyErr
@@ -531,6 +550,7 @@ func (f *FileStore) DeleteRange(keys [][]byte, min, max int64) error {
 	f.mu.Lock()
 	f.lastModified = time.Now().UTC()
 	f.lastFileStats = nil
+	f.lastExtFileStats = nil
 	f.mu.Unlock()
 	return nil
 }
@@ -704,6 +724,7 @@ func (f *FileStore) Close() error {
 	files := f.files
 
 	f.lastFileStats = nil
+	f.lastExtFileStats = nil
 	f.files = nil
 
 	f.stats.SetFiles(0)
@@ -867,6 +888,49 @@ func (f *FileStore) Stats() []FileStat {
 		f.lastFileStats = append(f.lastFileStats, fd.Stats())
 	}
 	return f.lastFileStats
+}
+
+// ExtStats returns the extended stats of the underlying files, preferring the cached version if it is still valid.
+func (f *FileStore) ExtStats() []ExtFileStat {
+	f.mu.RLock()
+	if len(f.lastExtFileStats) > 0 {
+		defer f.mu.RUnlock()
+		return f.lastExtFileStats
+	}
+	f.mu.RUnlock()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.lastExtFileStats) > 0 {
+		return f.lastExtFileStats
+	}
+
+	if cap(f.lastExtFileStats) < len(f.files)/2 {
+		f.lastExtFileStats = make([]ExtFileStat, 0, len(f.files))
+	}
+
+	for _, fd := range f.files {
+		if provider, ok := fd.(tsmFileExtStatsProvider); ok {
+			extStat, err := provider.ExtStats()
+			if err == nil {
+				f.lastExtFileStats = append(f.lastExtFileStats, extStat)
+				continue
+			}
+		}
+		// Fallback for mocks
+		extStat := fd.Stats().ToExtFileStat()
+		iter := fd.BlockIterator()
+		if iter.Next() {
+			_, _, _, _, _, block, err := iter.Read()
+			if err == nil {
+				cnt, _ := BlockCount(block)
+				extStat.FirstBlockCount = cnt
+			}
+		}
+		f.lastExtFileStats = append(f.lastExtFileStats, extStat)
+	}
+	return f.lastExtFileStats
 }
 
 // Replace replaces oldFiles with newFiles.
@@ -1044,6 +1108,7 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 	f.lastModified = maxTime.UTC()
 
 	f.lastFileStats = nil
+	f.lastExtFileStats = nil
 	f.files = active
 	sort.Sort(tsmReaders(f.files))
 	f.stats.SetFiles(int64(len(f.files)))

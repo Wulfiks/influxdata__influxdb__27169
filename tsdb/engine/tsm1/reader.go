@@ -49,6 +49,9 @@ type TSMReader struct {
 	// lastModified is the last time this file was modified on disk
 	lastModified int64
 
+	firstBlockCountCached bool
+	firstBlockCount       int
+
 	// deleteMu limits concurrent deletes
 	deleteMu sync.Mutex
 }
@@ -576,6 +579,66 @@ func (t *TSMReader) Stats() FileStat {
 		MaxKey:       maxKey,
 		HasTombstone: t.tombstoner.HasTombstones(),
 	}
+}
+
+// ExtStats returns the ExtFileStat for the TSMReader's underlying file.
+func (t *TSMReader) ExtStats() (ExtFileStat, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.firstBlockCountCached {
+		cnt, err := t.readFirstBlockCount()
+		if err != nil {
+			return ExtFileStat{}, err
+		}
+		t.firstBlockCount = cnt
+		t.firstBlockCountCached = true
+	}
+
+	return ExtFileStat{
+		FileStat:        t.statsNoLock(),
+		FirstBlockCount: t.firstBlockCount,
+	}, nil
+}
+
+func (t *TSMReader) statsNoLock() FileStat {
+	minTime, maxTime := t.index.TimeRange()
+	minKey, maxKey := t.index.KeyRange()
+	lm := t.lastModified
+	if ts := t.tombstoner.TombstoneStats(); ts.TombstoneExists {
+		if ts.LastModified > lm {
+			lm = ts.LastModified
+		}
+	}
+	return FileStat{
+		Path:         t.accessor.path(),
+		Size:         uint32(t.size),
+		LastModified: lm,
+		MinTime:      minTime,
+		MaxTime:      maxTime,
+		MinKey:       minKey,
+		MaxKey:       maxKey,
+		HasTombstone: t.tombstoner.HasTombstones(),
+	}
+}
+
+func (t *TSMReader) readFirstBlockCount() (int, error) {
+	if t.index.KeyCount() > 0 {
+		var cache []IndexEntry
+		_, _, entries := t.index.Key(0, &cache)
+		if len(entries) > 0 {
+			_, block, err := t.accessor.readBytes(&entries[0], nil)
+			if err != nil {
+				return 0, err
+			}
+			cnt, err := BlockCount(block)
+			if err != nil {
+				return 0, err
+			}
+			return cnt, nil
+		}
+	}
+	return 0, nil
 }
 
 // BlockIterator returns a BlockIterator for the underlying TSM file.
